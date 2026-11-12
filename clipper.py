@@ -3,7 +3,10 @@
 clipper.py - free, local, watermark-free "long video -> vertical shorts" pipeline.
 
     python clipper.py run <url_or_local_file> [--top 8] [--min 20] [--max 45]
-        [--model small] [--layout blur|crop] [--crop-x 0.5] [--no-captions]
+        [--model small] [--layout blur|crop|split] [--crop-x 0.5]
+        [--facecam x,y,w,h|NAME] [--split-top 0.4] [--no-captions]
+
+    python clipper.py facecam <video_or_url> [--at 1:00] [--box x,y,w,h] [--save NAME]
         [--keywords "a,b"] [--section 1:00:00-1:40:00] [--transcript file.json]
         [--work work] [--out clips] [--dry-run]
 
@@ -55,6 +58,8 @@ MIN_WORDS = 10
 # Render knobs
 OUT_W, OUT_H = 1080, 1920
 CAPTION_FONT, CAPTION_SIZE, CAPTION_MARGIN_V = "Arial", 84, 520
+SPLIT_TOP = 0.40          # split layout: share of the 1920px height given to the facecam panel
+FACECAM_FILE = Path(__file__).resolve().with_name("facecams.json")   # saved per-streamer boxes
 WORDS_PER_CHUNK = 3
 
 
@@ -482,7 +487,7 @@ def ass_escape(s: str) -> str:
     return s.replace("\\", "").replace("{", "(").replace("}", ")").upper()
 
 
-def build_ass(words: list[dict], clip: Clip) -> str:
+def build_ass(words: list[dict], clip: Clip, margin_v: int = CAPTION_MARGIN_V) -> str:
     head = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {OUT_W}
@@ -492,7 +497,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{CAPTION_FONT},{CAPTION_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,2,70,70,{CAPTION_MARGIN_V},1
+Style: Default,{CAPTION_FONT},{CAPTION_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,3,2,70,70,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -522,9 +527,38 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return head + "\n".join(lines) + "\n"
 
 
-def video_filter(layout: str, crop_x: float, captions: bool) -> str:
-    if layout == "crop":
-        cx = min(1.0, max(0.0, crop_x))
+@dataclass
+class Layout:
+    name: str = "blur"                     # blur | crop | split
+    crop_x: float = 0.5                    # crop/split: horizontal position of the gameplay crop
+    facecam: tuple[float, float, float, float] | None = None   # split: x, y, w, h as 0-1 fractions
+    split_top: float = SPLIT_TOP           # split: share of output height for the facecam panel
+
+    @property
+    def top_h(self) -> int:
+        return int(round(OUT_H * self.split_top / 2)) * 2       # even pixel count
+
+    @property
+    def caption_margin_v(self) -> int:
+        # split: centre the captions on the seam between facecam and gameplay
+        return OUT_H - self.top_h - CAPTION_SIZE // 2 - 10 if self.name == "split" else CAPTION_MARGIN_V
+
+
+def video_filter(lay: Layout, captions: bool) -> str:
+    cx = min(1.0, max(0.0, lay.crop_x))
+    if lay.name == "split":
+        if not lay.facecam:
+            raise ClipperError("--layout split needs --facecam (x,y,w,h or a saved name). "
+                               "Find the box with: python clipper.py facecam <video>")
+        x, y, w, h = lay.facecam
+        top, bot = lay.top_h, OUT_H - lay.top_h
+        fc = (f"[0:v]split=2[cam][game];"
+              f"[cam]crop=w=iw*{w:.5f}:h=ih*{h:.5f}:x=iw*{x:.5f}:y=ih*{y:.5f},"
+              f"scale={OUT_W}:{top}:force_original_aspect_ratio=increase,crop={OUT_W}:{top},setsar=1[top];"
+              f"[game]crop=w='min(iw,ih*{OUT_W}/{bot})':h='min(ih,iw*{bot}/{OUT_W})':"
+              f"x='(iw-ow)*{cx:.4f}':y='(ih-oh)/2',scale={OUT_W}:{bot},setsar=1[bot];"
+              f"[top][bot]vstack=inputs=2[v0]")
+    elif lay.name == "crop":
         fc = (f"[0:v]crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)':x='(iw-ow)*{cx:.4f}':y='(ih-oh)/2',"
               f"scale={OUT_W}:{OUT_H},setsar=1[v0]")
     else:
@@ -541,16 +575,57 @@ def video_filter(layout: str, crop_x: float, captions: bool) -> str:
     return fc
 
 
-def render(video: Path, clip: Clip, out_path: Path, words: list[dict], layout: str, crop_x: float,
-           captions: bool) -> None:
+def probe_size(video: Path) -> tuple[int, int]:
+    out = run_cmd([need_bin("ffprobe"), "-v", "error", "-select_streams", "v:0",
+                   "-show_entries", "stream=width,height", "-of", "csv=p=0", str(video)]).stdout.strip()
+    try:
+        w, h = (int(v) for v in out.split(",")[:2])
+        return w, h
+    except ValueError:
+        raise ClipperError(f"Could not read the video size of {video}")
+
+
+def load_facecams() -> dict:
+    if FACECAM_FILE.exists():
+        try:
+            return json.loads(FACECAM_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise ClipperError(f"{FACECAM_FILE.name} is not valid JSON: {e}")
+    return {}
+
+
+def parse_facecam(spec: str, video: Path | None) -> tuple[float, float, float, float]:
+    """'x,y,w,h' as 0-1 fractions or source pixels, or the name of a saved preset."""
+    nums = re.fullmatch(r"\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*", spec)
+    if nums:
+        vals = [float(v) for v in nums.groups()]
+        if any(v > 1 for v in vals):                    # pixels -> fractions of the source frame
+            if video is None:
+                raise ClipperError("Pixel facecam boxes need the video to read its size.")
+            sw, sh = probe_size(video)
+            vals = [vals[0] / sw, vals[1] / sh, vals[2] / sw, vals[3] / sh]
+        x, y, w, h = vals
+        if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > 1.001 or y + h > 1.001:
+            raise ClipperError(f"--facecam box {spec!r} is outside the frame. Use x,y,w,h with x+w<=1 and y+h<=1 "
+                               "(fractions) or pixel values inside the video size.")
+        return (round(x, 4), round(y, 4), round(min(w, 1 - x), 4), round(min(h, 1 - y), 4))
+    presets = load_facecams()
+    if spec in presets:
+        return tuple(presets[spec])  # type: ignore[return-value]
+    known = ", ".join(sorted(presets)) or "none saved yet"
+    raise ClipperError(f"Unknown facecam {spec!r}. Use x,y,w,h or a saved name ({known}).\n"
+                       "  Save one with: python clipper.py facecam <video> --box x,y,w,h --save NAME")
+
+
+def render(video: Path, clip: Clip, out_path: Path, words: list[dict], lay: Layout, captions: bool) -> None:
     ff = need_bin("ffmpeg")
     with tempfile.TemporaryDirectory(prefix="clipper_") as td:
         tdir = Path(td)
         if captions:
-            (tdir / "captions.ass").write_text(build_ass(words, clip), encoding="utf-8")
+            (tdir / "captions.ass").write_text(build_ass(words, clip, lay.caption_margin_v), encoding="utf-8")
         args = [ff, "-hide_banner", "-loglevel", "error", "-y",
                 "-ss", f"{clip.start:.3f}", "-i", str(video.resolve()), "-t", f"{clip.dur:.3f}",
-                "-filter_complex", video_filter(layout, crop_x, captions),
+                "-filter_complex", video_filter(lay, captions),
                 "-map", "[v]", "-map", "0:a:0?",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
@@ -587,6 +662,14 @@ def cmd_run(a: argparse.Namespace) -> int:
         if not video.exists():
             raise ClipperError(f"Input file not found: {video}")
         file_sec = sec                   # analyse only this range of the local file
+
+    lay = Layout(a.layout, a.crop_x, None, a.split_top)
+    if a.layout == "split":
+        if not a.facecam:
+            raise ClipperError("--layout split needs --facecam (x,y,w,h or a saved name).\n"
+                               "  Find the box with: python clipper.py facecam <video_or_url> --at 1:00")
+        lay.facecam = parse_facecam(a.facecam, video)
+        log(f"[layout] split: facecam box {lay.facecam}, facecam panel {lay.top_h}px")
 
     duration = probe_duration(video)
     if a.transcript:
@@ -633,7 +716,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     for i, c in enumerate(clips, 1):
         name = f"clip_{i:02d}_{hms(c.start + offset, '-')}.mp4"
         log(f"[render] {i}/{len(clips)} {name} ({c.dur:.1f}s, layout={a.layout})")
-        render(video, c, out / name, words, a.layout, a.crop_x, not a.no_captions)
+        render(video, c, out / name, words, lay, not a.no_captions)
         rows.append({"file": name, "start": hms(c.start + offset), "end": hms(c.end + offset),
                      "start_s": round(c.start + offset, 3), "end_s": round(c.end + offset, 3),
                      "score": c.score, "snippet": c.snippet})
@@ -644,6 +727,53 @@ def cmd_run(a: argparse.Namespace) -> int:
         wr.writerows(rows)
     log(f"\n[done] {len(rows)} clips in {out.resolve()}  (metadata: {csv_path.name})")
     log("Review every clip by hand before posting, and only clip footage the campaign allows.")
+    return 0
+
+
+def cmd_facecam(a: argparse.Namespace) -> int:
+    """Save preview PNGs that help find the facecam box, optionally saving it as a named preset."""
+    check_binaries()
+    ff = need_bin("ffmpeg")
+    at = parse_time(a.at)
+    if is_url(a.source):
+        # only fetch a few seconds around --at
+        video = download(a.source, Path(a.work), (at, at + 4))
+        at_in_file = 1.0
+    else:
+        video = Path(a.source)
+        if not video.exists():
+            raise ClipperError(f"Input file not found: {video}")
+        at_in_file = at
+    sw, sh = probe_size(video)
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    grid = out / "facecam_grid.png"
+    # 10% grid (brighter every 50%) so the box can be read off as fractions
+    vf = ("drawgrid=w=iw/10:h=ih/10:t=2:c=white@0.45,"
+          "drawgrid=w=iw/2:h=ih/2:t=4:c=red@0.7")
+    box = parse_facecam(a.box, video) if a.box else None
+    if box:
+        x, y, w, h = box
+        vf += f",drawbox=x=iw*{x}:y=ih*{y}:w=iw*{w}:h=ih*{h}:t=6:c=yellow"
+    run_cmd([ff, "-v", "error", "-y", "-ss", f"{at_in_file:.3f}", "-i", str(video.resolve()),
+             "-frames:v", "1", "-vf", vf, str(grid.resolve())])
+    log(f"[facecam] source {sw}x{sh}. Grid preview: {grid.resolve()}")
+    log("          Thin lines every 10% of the frame, red lines at 50%.")
+    if not box:
+        log("          Read the facecam's left, top, width and height off the grid as fractions\n"
+            "          (e.g. 0.0,0.0,0.25,0.3) or as pixels, then rerun with --box to check it.")
+        return 0
+    split = out / "facecam_split_preview.png"
+    lay = Layout("split", a.crop_x, box, a.split_top)
+    run_cmd([ff, "-v", "error", "-y", "-ss", f"{at_in_file:.3f}", "-i", str(video.resolve()),
+             "-frames:v", "1", "-filter_complex", video_filter(lay, captions=False), "-map", "[v]",
+             str(split.resolve())])
+    log(f"[facecam] box {box} drawn in yellow. Split preview: {split.resolve()}")
+    if a.save:
+        presets = load_facecams()
+        presets[a.save] = list(box)
+        FACECAM_FILE.write_text(json.dumps(presets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        log(f"[facecam] saved as '{a.save}' in {FACECAM_FILE.name}. Use: --layout split --facecam {a.save}")
     return 0
 
 
@@ -670,8 +800,13 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--min", type=float, default=20, help="min clip length s (default 20)")
     r.add_argument("--max", type=float, default=45, help="max clip length s (default 45)")
     r.add_argument("--model", default="small", help="faster-whisper model: tiny/base/small/medium/large-v3")
-    r.add_argument("--layout", choices=["blur", "crop"], default="blur")
-    r.add_argument("--crop-x", type=float, default=0.5, help="crop layout: 0=left, 0.5=centre, 1=right")
+    r.add_argument("--layout", choices=["blur", "crop", "split"], default="blur",
+                   help="blur: full frame on blurred bg; crop: 9:16 slice; split: facecam on top, gameplay below")
+    r.add_argument("--crop-x", type=float, default=0.5,
+                   help="crop/split: gameplay crop position, 0=left, 0.5=centre, 1=right")
+    r.add_argument("--facecam", help='split: facecam box "x,y,w,h" (0-1 fractions or pixels) or a saved name')
+    r.add_argument("--split-top", type=float, default=SPLIT_TOP,
+                   help=f"split: share of the height for the facecam panel (default {SPLIT_TOP})")
     r.add_argument("--no-captions", action="store_true")
     r.add_argument("--keywords", default="", help='extra keywords, comma-separated: "chat,clip it"')
     r.add_argument("--section", metavar="START-END",
@@ -681,8 +816,23 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--work", default="work", help="download/cache dir (default work)")
     r.add_argument("--out", default="clips", help="output dir (default clips)")
     r.add_argument("--dry-run", action="store_true", help="only print the picks")
+    f = sub.add_parser("facecam", help="preview/find the facecam box for --layout split and save it per streamer")
+    f.add_argument("source", help="local video or URL (a URL downloads only ~4 s around --at)")
+    f.add_argument("--at", default="60", help="timestamp to grab the frame from (default 60 = 1:00)")
+    f.add_argument("--box", help='facecam box to check, "x,y,w,h" (fractions or pixels)')
+    f.add_argument("--save", metavar="NAME", help="save --box as a preset, e.g. the streamer's name")
+    f.add_argument("--crop-x", type=float, default=0.5, help="gameplay crop position for the split preview")
+    f.add_argument("--split-top", type=float, default=SPLIT_TOP, help="facecam panel share for the preview")
+    f.add_argument("--work", default="work", help="download dir for URLs (default work)")
+    f.add_argument("--out", default="facecam_preview", help="where to write the preview PNGs")
     a = p.parse_args(argv)
     try:
+        if a.cmd == "facecam":
+            if a.save and not a.box:
+                raise ClipperError("--save needs --box x,y,w,h")
+            return cmd_facecam(a)
+        if not 0.15 <= a.split_top <= 0.7:
+            raise ClipperError("--split-top should be between 0.15 and 0.7")
         return cmd_run(a)
     except ClipperError as e:
         print(f"\n[error] {e}", file=sys.stderr)

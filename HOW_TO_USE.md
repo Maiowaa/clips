@@ -117,7 +117,10 @@ Clipper never uploads anything. You post the clips yourself.
 | `--model base` | small | Whisper model: `tiny` (fastest) → `base` → `small` → `medium` (most accurate, slow) |
 | `--layout blur` | blur | Full frame over a blurred background (keeps HUD, minimap and facecam) |
 | `--layout crop` | | Fills the screen with a 9:16 slice |
-| `--crop-x 0.5` | 0.5 | Where to cut for `crop`: `0` = left edge, `1` = right edge |
+| `--layout split` | | Facecam on top, gameplay below (needs `--facecam`, see section 4) |
+| `--facecam kai` | | Split: a saved preset name, or a box `x,y,w,h` |
+| `--split-top 0.4` | 0.4 | Split: share of the height for the facecam |
+| `--crop-x 0.5` | 0.5 | Where to cut the gameplay for `crop`/`split`: `0` = left edge, `1` = right edge |
 | `--keywords "a,b"` | | Extra hype words or phrases to boost |
 | `--no-captions` | | Skip burned-in captions |
 | `--dry-run` | | Print the picks and render nothing |
@@ -128,7 +131,41 @@ To change the keywords permanently, edit the `KEYWORDS` list at the top of `clip
 
 ---
 
-## 4. Recipes
+## 4. Split layout (facecam on top, gameplay below)
+
+This is the classic streamer-shorts format. You set the facecam box **once per streamer** and reuse it.
+
+**1. Get a grid screenshot** from a moment where the facecam is visible. This works with a local file or a URL; a URL downloads only about 4 seconds of video.
+
+```bash
+python clipper.py facecam "VOD_URL_or_file" --at 1:00:00
+```
+
+Open `facecam_preview/facecam_grid.png`. The thin lines are every 10% of the frame and the red lines are at 50%. Note the facecam's left, top, width and height. Fractions work (`0.0,0.25,0.2,0.2`), and so do source pixels (`6,268,388,216` on a 1920x1080 stream).
+
+**2. Check the box and save it under the streamer's name:**
+
+```bash
+python clipper.py facecam "VOD_URL_or_file" --at 1:00:00 --box 6,268,388,216 --save kai
+```
+
+Check `facecam_preview/facecam_split_preview.png`. If the face is cut off, adjust `--box` and run it again. `--crop-x` moves the gameplay crop left or right in the preview too.
+
+**3. Render with the preset:**
+
+```bash
+python clipper.py run "VOD_URL" --section 1:00:00-1:40:00 --model base --layout split --facecam kai
+```
+
+- `--split-top 0.4` (default) gives the facecam 40% of the height. Use `0.33` for a smaller cam.
+- Captions sit on the seam between the two panels.
+- Presets are stored in `facecams.json`.
+- **No facecam?** Many GTA RP streamers (e.g. NoPixel) don't show one. Use `--layout blur` or `crop` for them.
+- If the streamer moves their facecam between streams, save a new preset.
+
+---
+
+## 5. Recipes
 
 **Whole stream in chunks** (use a different `--out` per chunk so files don't mix):
 
@@ -151,7 +188,7 @@ python clipper.py run "D:\recordings\stream.mp4" --section 30:00-1:10:00 --model
 
 ---
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
 | Problem | Fix |
 |---|---|
@@ -167,7 +204,7 @@ python clipper.py run "D:\recordings\stream.mp4" --section 30:00-1:10:00 --model
 
 ---
 
-## 6. Where files go and cleanup
+## 7. Where files go and cleanup
 
 - `work/`: downloaded VOD chunks (`*.mp4`, about 1.3 GB per 40 min at 1080p) and cached transcripts (`*.transcript.json`). **Safe to delete** once you're done with a stream; it gets re-downloaded if needed.
 - `clips/`: your finished shorts and `clips.csv`.

@@ -48,6 +48,7 @@ Output goes to `clips/clip_01_0-12-34.mp4` and so on, plus `clips/clips.csv` (fi
 - **`--min` / `--max`**: the scoring window is about (min+max)/2 seconds. Use 15–30 for punchy TikTok/Shorts clips, and 30–60 when you need context, such as a full chase.
 - **`--keywords`**: add the streamer's catchphrases, and names of crew members or places they shout. To change them permanently, edit `KEYWORDS` at the top of `clipper.py`.
 - **`--layout blur`** (default) keeps the whole gameplay frame, which is safest for HUD and minimap. **`--layout crop`** fills the screen. Use `--crop-x` (0 = left, 1 = right) to follow the action or the facecam.
+- **`--layout split --facecam NAME`** puts the facecam on top and the gameplay below, with captions on the seam. Find and save the box once per streamer with `python clipper.py facecam <video_or_url> --at 1:00 --box x,y,w,h --save NAME`. Step-by-step instructions are in [HOW_TO_USE.md](HOW_TO_USE.md#4-split-layout-facecam-on-top-gameplay-below).
 - **`--model`**: `tiny`/`base` are fast on CPU, `small` is the best default, and `medium` is more accurate but slow.
 - **`--transcript file.json`** skips Whisper entirely. Use it for re-tuning, or with a transcript you already have.
 - Scoring weights (`W_ENERGY`, `W_TEXT`, `GAP_BUFFER` …) are constants at the top of the file.
