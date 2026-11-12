@@ -594,9 +594,33 @@ def load_facecams() -> dict:
     return {}
 
 
-def parse_facecam(spec: str, video: Path | None) -> tuple[float, float, float, float]:
-    """'x,y,w,h' as 0-1 fractions or source pixels, or the name of a saved preset."""
+Box = tuple[float, float, float, float]      # x, y, w, h as 0-1 fractions of the source frame
+
+
+def preset_boxes(value) -> list[Box]:
+    """A preset is one box [x,y,w,h] or a list of boxes (one per stream scene/layout)."""
+    if value and isinstance(value[0], (int, float)):
+        return [tuple(value)]  # type: ignore[list-item]
+    return [tuple(b) for b in value]  # type: ignore[misc]
+
+
+def parse_facecam(spec: str, video: Path | None) -> list[Box]:
+    """'x,y,w,h' (0-1 fractions or source pixels) or a saved preset name -> candidate boxes."""
     nums = re.fullmatch(r"\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*", spec)
+    if nums:
+        return [parse_box(spec, video)]
+    presets = load_facecams()
+    if spec in presets:
+        return preset_boxes(presets[spec])
+    known = ", ".join(sorted(presets)) or "none saved yet"
+    raise ClipperError(f"Unknown facecam {spec!r}. Use x,y,w,h or a saved name ({known}).\n"
+                       "  Save one with: python clipper.py facecam <video> --box x,y,w,h --save NAME")
+
+
+def parse_box(spec: str, video: Path | None) -> Box:
+    nums = re.fullmatch(r"\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*", spec)
+    if not nums:
+        raise ClipperError(f"Box must be x,y,w,h (got {spec!r})")
     if nums:
         vals = [float(v) for v in nums.groups()]
         if any(v > 1 for v in vals):                    # pixels -> fractions of the source frame
@@ -609,12 +633,101 @@ def parse_facecam(spec: str, video: Path | None) -> tuple[float, float, float, f
             raise ClipperError(f"--facecam box {spec!r} is outside the frame. Use x,y,w,h with x+w<=1 and y+h<=1 "
                                "(fractions) or pixel values inside the video size.")
         return (round(x, 4), round(y, 4), round(min(w, 1 - x), 4), round(min(h, 1 - y), 4))
-    presets = load_facecams()
-    if spec in presets:
-        return tuple(presets[spec])  # type: ignore[return-value]
-    known = ", ".join(sorted(presets)) or "none saved yet"
-    raise ClipperError(f"Unknown facecam {spec!r}. Use x,y,w,h or a saved name ({known}).\n"
-                       "  Save one with: python clipper.py facecam <video> --box x,y,w,h --save NAME")
+    raise AssertionError
+
+
+# --- facecam overlay detection ------------------------------------------------
+# A facecam is pasted onto the stream as a rectangle, so its border is a sharp, straight edge that
+# survives whatever the streamer does (head down, looking away) and vanishes when the scene changes
+# (fullscreen cam, BRB, IRL). We score each candidate box by edge strength *on* its border vs just
+# beside it: ~1 = no overlay there (max 1.1 measured), real overlays 5-30 on Kai/Lacy/Stable Ronaldo VODs.
+BORDER_MIN = 3.0          # median border score needed to trust a box
+FACECAM_SAMPLES = 5       # frames sampled per clip
+
+
+def grab_gray(video: Path, t: float, size: tuple[int, int]):
+    import numpy as np
+    sw, sh = size
+    raw = subprocess.run([need_bin("ffmpeg"), "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", str(video),
+                          "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                         capture_output=True).stdout
+    if len(raw) < sw * sh:
+        return None
+    return np.frombuffer(raw[: sw * sh], np.uint8).reshape(sh, sw).astype(np.float32)
+
+
+def to_px(box: Box, size: tuple[int, int]) -> tuple[int, int, int, int]:
+    sw, sh = size
+    x, y, w, h = box
+    return int(round(x * sw)), int(round(y * sh)), int(round(w * sw)), int(round(h * sh))
+
+
+def border_score(img, px: tuple[int, int, int, int]) -> float:
+    import numpy as np
+    H, W = img.shape
+    x, y, w, h = px
+    gx = np.abs(np.diff(img, axis=1))       # gx[:, c] = |img[:, c+1] - img[:, c]|
+    gy = np.abs(np.diff(img, axis=0))
+    ys = slice(y + h // 10, y + h - h // 10)
+    xs = slice(x + w // 10, x + w - w // 10)
+
+    def side(profile, pos: int, lim: int) -> float:
+        on = max(profile(p) for p in range(pos - 2, pos + 2) if 0 <= p < lim)
+        off = [profile(p) for d in range(5, 12) for p in (pos - d, pos + d) if 0 <= p < lim]
+        return on / (float(np.mean(off)) + 1.0)
+
+    sides = []
+    if x > 3:
+        sides.append(side(lambda c: gx[ys, c].mean(), x - 1, W - 1))
+    if x + w < W - 3:
+        sides.append(side(lambda c: gx[ys, c].mean(), x + w - 1, W - 1))
+    if y > 3:
+        sides.append(side(lambda r: gy[r, xs].mean(), y - 1, H - 1))
+    if y + h < H - 3:
+        sides.append(side(lambda r: gy[r, xs].mean(), y + h - 1, H - 1))
+    # Mean of the two strongest sides: in dark scenes one or two cam sides blend into the gameplay,
+    # but a real overlay still has >= 2 clear edges, while empty boxes stay ~1 on every side.
+    top2 = sorted(sides, reverse=True)[:2]
+    return float(np.mean(top2)) if top2 else 0.0
+
+
+def snap_box(img, px: tuple[int, int, int, int], radius: int = 30) -> tuple[int, int, int, int]:
+    """Move each side of a rough box to the strongest straight edge within `radius` px."""
+    import numpy as np
+    H, W = img.shape
+    x, y, w, h = px
+    gx = np.abs(np.diff(img, axis=1))
+    gy = np.abs(np.diff(img, axis=0))
+    ys = slice(y + h // 10, y + h - h // 10)
+    xs = slice(x + w // 10, x + w - w // 10)
+
+    def best(profile, guess: int, lim: int) -> int:
+        # Among strong edges (>= 60% of the strongest nearby), take the one closest to the guess, so
+        # a neighbouring overlay (e.g. a viewer-count bar under the cam) doesn't steal the edge.
+        cands = list(range(max(0, guess - radius), min(lim, guess + radius)))
+        if not cands:
+            return guess
+        vals = {p: profile(p) for p in cands}
+        strong = [p for p in cands if vals[p] >= 0.6 * max(vals.values())]
+        return min(strong, key=lambda p: abs(p - guess)) + 1
+
+    left = 0 if x <= radius else best(lambda c: gx[ys, c].mean(), x - 1, W - 1)
+    right = W if x + w >= W - radius else best(lambda c: gx[ys, c].mean(), x + w - 1, W - 1)
+    top = 0 if y <= radius else best(lambda r: gy[r, xs].mean(), y - 1, H - 1)
+    bottom = H if y + h >= H - radius else best(lambda r: gy[r, xs].mean(), y + h - 1, H - 1)
+    return left, top, right - left, bottom - top
+
+
+def choose_facecam(video: Path, clip: Clip, boxes: list[Box], size: tuple[int, int]) -> tuple[Box | None, float]:
+    """Pick the candidate box whose overlay border is present during this clip (None = no facecam)."""
+    import numpy as np
+    times = [clip.start + clip.dur * (i + 0.5) / FACECAM_SAMPLES for i in range(FACECAM_SAMPLES)]
+    frames = [f for f in (grab_gray(video, t, size) for t in times) if f is not None]
+    if not frames:
+        return None, 0.0
+    scored = [(float(np.median([border_score(f, to_px(b, size)) for f in frames])), b) for b in boxes]
+    score, box = max(scored, key=lambda s: s[0])
+    return (box if score >= BORDER_MIN else None), score
 
 
 def render(video: Path, clip: Clip, out_path: Path, words: list[dict], lay: Layout, captions: bool) -> None:
@@ -668,8 +781,9 @@ def cmd_run(a: argparse.Namespace) -> int:
         if not a.facecam:
             raise ClipperError("--layout split needs --facecam (x,y,w,h or a saved name).\n"
                                "  Find the box with: python clipper.py facecam <video_or_url> --at 1:00")
-        lay.facecam = parse_facecam(a.facecam, video)
-        log(f"[layout] split: facecam box {lay.facecam}, facecam panel {lay.top_h}px")
+        cam_boxes = parse_facecam(a.facecam, video)
+        log(f"[layout] split: {len(cam_boxes)} facecam position(s) for '{a.facecam}', facecam panel {lay.top_h}px"
+            + ("" if a.no_facecam_check else "; each clip is checked and falls back to blur if no facecam"))
 
     duration = probe_duration(video)
     if a.transcript:
@@ -713,13 +827,26 @@ def cmd_run(a: argparse.Namespace) -> int:
 
     out.mkdir(parents=True, exist_ok=True)
     rows = []
+    size = probe_size(video) if a.layout == "split" else (0, 0)
     for i, c in enumerate(clips, 1):
         name = f"clip_{i:02d}_{hms(c.start + offset, '-')}.mp4"
-        log(f"[render] {i}/{len(clips)} {name} ({c.dur:.1f}s, layout={a.layout})")
-        render(video, c, out / name, words, lay, not a.no_captions)
+        clip_lay, used = lay, a.layout
+        if a.layout == "split":
+            if a.no_facecam_check:
+                box, note = cam_boxes[0], "split"
+            else:
+                box, bscore = choose_facecam(video, c, cam_boxes, size)
+                note = f"split (facecam edge {bscore:.1f})" if box else f"blur: no facecam found (edge {bscore:.1f})"
+            if box:
+                clip_lay = Layout("split", a.crop_x, box, a.split_top)
+            else:
+                clip_lay = Layout("blur", a.crop_x, None, a.split_top)
+            used = note
+        log(f"[render] {i}/{len(clips)} {name} ({c.dur:.1f}s, layout={used})")
+        render(video, c, out / name, words, clip_lay, not a.no_captions)
         rows.append({"file": name, "start": hms(c.start + offset), "end": hms(c.end + offset),
                      "start_s": round(c.start + offset, 3), "end_s": round(c.end + offset, 3),
-                     "score": c.score, "snippet": c.snippet})
+                     "score": c.score, "layout": used, "snippet": c.snippet})
     csv_path = out / "clips.csv"
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
         wr = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -751,8 +878,22 @@ def cmd_facecam(a: argparse.Namespace) -> int:
     # 10% grid (brighter every 50%) so the box can be read off as fractions
     vf = ("drawgrid=w=iw/10:h=ih/10:t=2:c=white@0.45,"
           "drawgrid=w=iw/2:h=ih/2:t=4:c=red@0.7")
-    box = parse_facecam(a.box, video) if a.box else None
+    box = parse_box(a.box, video) if a.box else None
     if box:
+        img = grab_gray(video, at_in_file, (sw, sh))
+        if img is not None:
+            px = to_px(box, (sw, sh))
+            if not a.no_snap:
+                snapped = snap_box(img, px)
+                if snapped != px:
+                    log(f"[facecam] snapped your box {px} to the overlay edges -> {snapped} (pixels)")
+                px = snapped
+                box = (round(px[0] / sw, 4), round(px[1] / sh, 4), round(px[2] / sw, 4), round(px[3] / sh, 4))
+            score = border_score(img, px)
+            ok = score >= BORDER_MIN
+            log(f"[facecam] overlay edge score {score:.1f} "
+                + ("(looks like a real facecam border)" if ok else
+                   f"(WEAK: below {BORDER_MIN}; is the facecam visible at --at? is the box right?)"))
         x, y, w, h = box
         vf += f",drawbox=x=iw*{x}:y=ih*{y}:w=iw*{w}:h=ih*{h}:t=6:c=yellow"
     run_cmd([ff, "-v", "error", "-y", "-ss", f"{at_in_file:.3f}", "-i", str(video.resolve()),
@@ -771,9 +912,15 @@ def cmd_facecam(a: argparse.Namespace) -> int:
     log(f"[facecam] box {box} drawn in yellow. Split preview: {split.resolve()}")
     if a.save:
         presets = load_facecams()
-        presets[a.save] = list(box)
-        FACECAM_FILE.write_text(json.dumps(presets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        log(f"[facecam] saved as '{a.save}' in {FACECAM_FILE.name}. Use: --layout split --facecam {a.save}")
+        boxes = [] if a.reset or a.save not in presets else [list(b) for b in preset_boxes(presets[a.save])]
+        if any(max(abs(p - q) for p, q in zip(b, box)) < 0.01 for b in boxes):
+            log(f"[facecam] '{a.save}' already has this position; not adding a duplicate.")
+        else:
+            boxes.append(list(box))
+            presets[a.save] = boxes
+            FACECAM_FILE.write_text(json.dumps(presets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            log(f"[facecam] saved '{a.save}' position #{len(boxes)} in {FACECAM_FILE.name}. "
+                f"Use: --layout split --facecam {a.save}")
     return 0
 
 
@@ -807,6 +954,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--facecam", help='split: facecam box "x,y,w,h" (0-1 fractions or pixels) or a saved name')
     r.add_argument("--split-top", type=float, default=SPLIT_TOP,
                    help=f"split: share of the height for the facecam panel (default {SPLIT_TOP})")
+    r.add_argument("--no-facecam-check", action="store_true",
+                   help="split: always use the first facecam box (skip per-clip detection/blur fallback)")
     r.add_argument("--no-captions", action="store_true")
     r.add_argument("--keywords", default="", help='extra keywords, comma-separated: "chat,clip it"')
     r.add_argument("--section", metavar="START-END",
@@ -820,7 +969,11 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("source", help="local video or URL (a URL downloads only ~4 s around --at)")
     f.add_argument("--at", default="60", help="timestamp to grab the frame from (default 60 = 1:00)")
     f.add_argument("--box", help='facecam box to check, "x,y,w,h" (fractions or pixels)')
-    f.add_argument("--save", metavar="NAME", help="save --box as a preset, e.g. the streamer's name")
+    f.add_argument("--save", metavar="NAME",
+                   help="add --box to the streamer's preset (a preset can hold several positions, "
+                        "one per stream scene); clipper picks the right one per clip")
+    f.add_argument("--reset", action="store_true", help="with --save: replace the preset instead of adding")
+    f.add_argument("--no-snap", action="store_true", help="don't snap --box to the overlay's edges")
     f.add_argument("--crop-x", type=float, default=0.5, help="gameplay crop position for the split preview")
     f.add_argument("--split-top", type=float, default=SPLIT_TOP, help="facecam panel share for the preview")
     f.add_argument("--work", default="work", help="download dir for URLs (default work)")

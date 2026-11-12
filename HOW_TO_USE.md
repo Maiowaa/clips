@@ -118,7 +118,8 @@ Clipper never uploads anything. You post the clips yourself.
 | `--layout blur` | blur | Full frame over a blurred background (keeps HUD, minimap and facecam) |
 | `--layout crop` | | Fills the screen with a 9:16 slice |
 | `--layout split` | | Facecam on top, gameplay below (needs `--facecam`, see section 4) |
-| `--facecam kai` | | Split: a saved preset name, or a box `x,y,w,h` |
+| `--facecam kai` | | Split: a saved preset (`kai`, `lacy`, `stableronaldo`, `ron`) or a box `x,y,w,h` |
+| `--no-facecam-check` | | Split: skip the per-clip check and the blur fallback |
 | `--split-top 0.4` | 0.4 | Split: share of the height for the facecam |
 | `--crop-x 0.5` | 0.5 | Where to cut the gameplay for `crop`/`split`: `0` = left edge, `1` = right edge |
 | `--keywords "a,b"` | | Extra hype words or phrases to boost |
@@ -133,35 +134,62 @@ To change the keywords permanently, edit the `KEYWORDS` list at the top of `clip
 
 ## 4. Split layout (facecam on top, gameplay below)
 
-This is the classic streamer-shorts format. You set the facecam box **once per streamer** and reuse it.
+This is the classic streamer-shorts format: the streamer's facecam fills the top, the gameplay is below, and the captions sit on the seam.
 
-**1. Get a grid screenshot** from a moment where the facecam is visible. This works with a local file or a URL; a URL downloads only about 4 seconds of video.
+### Ready-made streamers: nothing to set up
 
-```bash
-python clipper.py facecam "VOD_URL_or_file" --at 1:00:00
-```
+These presets are already saved in `facecams.json`. They were measured from each streamer's real Twitch VODs:
 
-Open `facecam_preview/facecam_grid.png`. The thin lines are every 10% of the frame and the red lines are at 50%. Note the facecam's left, top, width and height. Fractions work (`0.0,0.25,0.2,0.2`), and so do source pixels (`6,268,388,216` on a 1920x1080 stream).
-
-**2. Check the box and save it under the streamer's name:**
-
-```bash
-python clipper.py facecam "VOD_URL_or_file" --at 1:00:00 --box 6,268,388,216 --save kai
-```
-
-Check `facecam_preview/facecam_split_preview.png`. If the face is cut off, adjust `--box` and run it again. `--crop-x` moves the gameplay crop left or right in the preview too.
-
-**3. Render with the preset:**
+| Preset | Streamer | Facecam positions saved |
+|---|---|---|
+| `kai` | Kai Cenat | GTA stream cam (YouTube restream), GTA cam (Twitch) |
+| `lacy` | Lacy | Gameplay cam |
+| `stableronaldo` / `ron` | Stable Ronaldo | Gameplay cam, browsing/desktop cam |
 
 ```bash
 python clipper.py run "VOD_URL" --section 1:00:00-1:40:00 --model base --layout split --facecam kai
 ```
 
+**It checks every clip automatically.** Streamers move their cam between scenes, for example a small cam during gameplay and a fullscreen cam while just chatting. For each clip, clipper looks at 5 frames and picks the saved position where a facecam overlay is actually on screen. It detects the overlay's sharp rectangular border, so this works even when the streamer looks down or away.
+
+- If none of the saved positions has a cam in that clip (fullscreen cam, BRB screen, IRL, or a new layout), that clip falls back to **blur**, so you never get a random piece of gameplay on top.
+- The terminal and `clips.csv` (column `layout`) show what each clip used, e.g. `split (facecam edge 11.6)` or `blur: no facecam found`.
+- `--no-facecam-check` turns the check off and always uses the first saved position.
+
+### Adding a new streamer, or a new cam position
+
+You only need to do this when a streamer isn't listed above, or when clips keep falling back to blur because the streamer changed their layout.
+
+**1. Get a grid screenshot** from a moment where the facecam is visible. With a URL, only about 4 seconds of video are downloaded.
+
+```bash
+python clipper.py facecam "VOD_URL_or_file" --at 1:00:00
+```
+
+Open `facecam_preview/facecam_grid.png` (thin lines every 10%, red lines at 50%) and roughly note the cam's left, top, width and height, in pixels or as 0–1 fractions.
+
+**2. Save it.** A rough box is fine: clipper **snaps it to the overlay's real edges** and tells you whether it looks right.
+
+```bash
+python clipper.py facecam "VOD_URL_or_file" --at 1:00:00 --box 0,380,520,300 --save lacy
+```
+
+```
+[facecam] snapped your box (0, 380, 520, 300) to the overlay edges -> (0, 383, 524, 295) (pixels)
+[facecam] overlay edge score 10.2 (looks like a real facecam border)
+[facecam] saved 'lacy' position #2 in facecams.json
+```
+
+- An edge score of **3 or more** means a real facecam border was found. If it says **WEAK**, the cam isn't visible at `--at` or the box is wrong.
+- `--save` **adds** a position to the streamer's preset, so you can save one for each scene. Use `--reset` to start the preset over.
+- Check `facecam_preview/facecam_split_preview.png` to see the result.
+- If snapping grabs the wrong edge (e.g. a viewer-count bar right under the cam), pass `--no-snap` with an exact box.
+
+### Options
+
 - `--split-top 0.4` (default) gives the facecam 40% of the height. Use `0.33` for a smaller cam.
-- Captions sit on the seam between the two panels.
-- Presets are stored in `facecams.json`.
-- **No facecam?** Many GTA RP streamers (e.g. NoPixel) don't show one. Use `--layout blur` or `crop` for them.
-- If the streamer moves their facecam between streams, save a new preset.
+- `--crop-x` moves the gameplay crop left or right.
+- **No facecam at all?** Many GTA RP streamers (e.g. NoPixel) don't show one. Use `--layout blur` or `crop` for them.
 
 ---
 
