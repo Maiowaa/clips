@@ -1,0 +1,23 @@
+# Media + caches (large, regenerate with the pipeline)
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.png
+*.ass
+*.transcript.json
+work/
+clips/
+real_work/
+real_clips*/
+
+# Generated test outputs (keep tests/make_synthetic.py)
+tests/out_*/
+tests/e2e_*/
+tests/synthetic.transcript.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
