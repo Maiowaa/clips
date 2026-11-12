@@ -4,7 +4,7 @@
 
 ## Install
 
-1. Python 3.10+, then:
+1. Python 3.11+ (yt-dlp is dropping 3.10). With pyenv, the repo's `.python-version` selects 3.11.9 automatically. Then:
    ```bash
    pip install -r requirements.txt
    ```

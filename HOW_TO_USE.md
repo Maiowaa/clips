@@ -6,6 +6,18 @@ This is a step-by-step guide to turning a long GTA stream into vertical shorts y
 
 ## 1. One-time setup
 
+You need **Python 3.11 or newer**. If you use pyenv, this folder's `.python-version` file switches you to 3.11.9 automatically:
+
+```bash
+pyenv install 3.11.9
+```
+
+```bash
+python --version
+```
+
+It should print `Python 3.11.9` when run inside this folder. Then:
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -145,7 +157,9 @@ python clipper.py run "D:\recordings\stream.mp4" --section 30:00-1:10:00 --model
 |---|---|
 | `'ffmpeg' not found` | Install it (section 1), then open a **new** terminal |
 | `Cannot allocate memory` from ffmpeg | Close other apps (browser tabs, games). Rendering 1080x1920 needs a few hundred MB free. |
-| `Download failed` | Run `pip install -U yt-dlp`. Sites change often. |
+| `Download failed` | Run `pip install -U "yt-dlp[default]"`. Sites change often. |
+| `403 Forbidden` during a download | Usually temporary on YouTube's side. Run the same command again. |
+| yt-dlp warns about a "JS challenge" or "n challenge" | Install the extras with `pip install -U "yt-dlp[default]"`. YouTube also needs a JS runtime such as [Deno](https://deno.com). |
 | Picks are mostly cutscenes or music | Add `--keywords` with the streamer's catchphrases, and use `--section` to skip mission-heavy parts |
 | Captions misspell names | Expected with small models. Try `--model small`, and fix it in your editor if it matters. |
 | Transcription is slow | Use `--model base` or `tiny`, and smaller `--section` chunks |

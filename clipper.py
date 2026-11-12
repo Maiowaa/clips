@@ -659,6 +659,9 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(errors="replace")  # type: ignore[attr-defined]
     except Exception:
         pass
+    if sys.version_info < (3, 11):
+        log(f"[warn] Python {sys.version_info.major}.{sys.version_info.minor} detected; clipper targets 3.11+ "
+            "(yt-dlp is dropping older versions). See README.")
     p = argparse.ArgumentParser(prog="clipper.py", description="Long video -> vertical shorts, fully local.")
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="download/transcribe/pick/render")
