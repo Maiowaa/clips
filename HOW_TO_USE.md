@@ -143,7 +143,7 @@ These presets are already saved in `facecams.json`. They were measured from each
 | Preset | Streamer | Facecam positions saved |
 |---|---|---|
 | `kai` | Kai Cenat | GTA stream cam (YouTube restream), GTA cam (Twitch) |
-| `lacy` | Lacy | Gameplay cam |
+| `lacy` | Lacy | Fortnite cam (left-middle), GTA 6 cam (top-left) |
 | `stableronaldo` / `ron` | Stable Ronaldo | Gameplay cam, browsing/desktop cam |
 
 ```bash
@@ -193,7 +193,44 @@ python clipper.py facecam "VOD_URL_or_file" --at 1:00:00 --box 0,380,520,300 --s
 
 ---
 
-## 5. Recipes
+## 5. Live clipping (while the streamer is live)
+
+For campaigns, the first good clip of a moment usually gets the views. `live` records the stream as it happens and turns it into clips **10–15 minutes after each moment**, so you can post while it's still fresh. It works for any channel on **Twitch, YouTube Live or Kick**.
+
+**New streamer from a rewards campaign? Set up their cam once, while they're live:**
+
+```bash
+python clipper.py facecam https://www.twitch.tv/lacy --live
+```
+
+That grabs 8 seconds of the live stream and writes `facecam_preview/facecam_grid.png`. Read the cam box off it, then save it (the rough box gets snapped to the real edges):
+
+```bash
+python clipper.py facecam work/live_sample_lacy.ts --at 3 --box 0,0,494,278 --save lacy
+```
+
+If the streamer has no cam, skip this and use `--layout blur`.
+
+**Start live clipping:**
+
+```bash
+python clipper.py live https://www.twitch.tv/lacy --layout split --facecam lacy --keywords "lacy,chat"
+```
+
+- **What it does:** it records in **10-minute chunks** (`--chunk`). As each chunk finishes, it's transcribed, scored and rendered, and the clips appear in `live_clips/<channel>/` named by the time of the moment, e.g. `lacy_20261118_21-14-05.mp4`.
+- **`clips.csv`** in that folder gets a new row for each clip, with the moment time, layout and caption snippet.
+- **`--top-per-chunk 2`** (default) is how many clips to make per chunk. `--chunk 5` gives faster clips but less context per pick.
+- **`--overlap 60`** re-checks the last minute of the previous chunk, so a moment on a chunk boundary isn't lost. It never makes the same clip twice.
+- **`--max-minutes 120`** stops after 2 hours. Otherwise it runs until the stream ends or you press **Ctrl+C**, which finishes the chunks already recorded and then exits.
+- **`--wait`** keeps checking an offline channel and starts by itself when they go live. It keeps watching after the stream ends, too.
+- **Disk use:** old chunks are deleted as soon as they're processed, so only the clips stay. `--keep-chunks` keeps everything, at about 2 GB per hour.
+- **Recording:** it uses **Streamlink** (`pip install streamlink`), which also filters Twitch ads, and falls back to yt-dlp if Streamlink isn't installed.
+
+Your PC has to stay on and connected while it runs. With `--model base`, a 10-minute chunk takes about 1–2 minutes to process on a normal laptop CPU, so it keeps up easily.
+
+---
+
+## 6. Recipes
 
 **Whole stream in chunks** (use a different `--out` per chunk so files don't mix):
 
@@ -216,7 +253,7 @@ python clipper.py run "D:\recordings\stream.mp4" --section 30:00-1:10:00 --model
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Problem | Fix |
 |---|---|
@@ -232,7 +269,7 @@ python clipper.py run "D:\recordings\stream.mp4" --section 30:00-1:10:00 --model
 
 ---
 
-## 7. Where files go and cleanup
+## 8. Where files go and cleanup
 
 - `work/`: downloaded VOD chunks (`*.mp4`, about 1.3 GB per 40 min at 1080p) and cached transcripts (`*.transcript.json`). **Safe to delete** once you're done with a stream; it gets re-downloaded if needed.
 - `clips/`: your finished shorts and `clips.csv`.

@@ -264,6 +264,9 @@ def decode_audio_range(video: Path, lo: float, hi: float | None):
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+_MODELS: dict = {}
+
+
 def transcribe(video: Path, model_name: str, cache: Path, rng: tuple[float, float] | None = None) -> dict:
     """Transcribe the whole file, or only rng=(lo, hi) seconds; timestamps are always file-absolute."""
     if cache.exists():
@@ -275,8 +278,10 @@ def transcribe(video: Path, model_name: str, cache: Path, rng: tuple[float, floa
     except ImportError:
         raise ClipperError("faster-whisper is not installed. Run: pip install faster-whisper\n"
                            "  (or pass an existing transcript with --transcript file.json)")
-    log(f"[transcribe] loading Whisper '{model_name}' (int8, CPU) - first run downloads the model")
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    model = _MODELS.get(model_name)
+    if model is None:   # keep it loaded: live mode transcribes a new chunk every few minutes
+        log(f"[transcribe] loading Whisper '{model_name}' (int8, CPU) - first run downloads the model")
+        model = _MODELS[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8")
     if rng:
         lo = rng[0]
         log(f"[transcribe] section {hms(rng[0])}-{hms(rng[1])}")
@@ -578,8 +583,9 @@ def video_filter(lay: Layout, captions: bool) -> str:
 def probe_size(video: Path) -> tuple[int, int]:
     out = run_cmd([need_bin("ffprobe"), "-v", "error", "-select_streams", "v:0",
                    "-show_entries", "stream=width,height", "-of", "csv=p=0", str(video)]).stdout.strip()
-    try:
-        w, h = (int(v) for v in out.split(",")[:2])
+    try:   # MPEG-TS files list the stream twice (program + stream): use the first line
+        first = next(line for line in out.splitlines() if line.strip())
+        w, h = (int(v) for v in first.split(",")[:2])
         return w, h
     except ValueError:
         raise ClipperError(f"Could not read the video size of {video}")
@@ -750,6 +756,32 @@ def render(video: Path, clip: Clip, out_path: Path, words: list[dict], lay: Layo
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def layout_for_clip(video: Path, c: Clip, a: argparse.Namespace, lay: Layout, cam_boxes: list[Box],
+                    size: tuple[int, int]) -> tuple[Layout, str]:
+    """Split layouts: pick the facecam position visible in this clip, or fall back to blur."""
+    if a.layout != "split":
+        return lay, a.layout
+    if a.no_facecam_check:
+        return Layout("split", a.crop_x, cam_boxes[0], a.split_top), "split"
+    box, bscore = choose_facecam(video, c, cam_boxes, size)
+    if box:
+        return Layout("split", a.crop_x, box, a.split_top), f"split (facecam edge {bscore:.1f})"
+    return Layout("blur", a.crop_x, None, a.split_top), f"blur: no facecam found (edge {bscore:.1f})"
+
+
+def resolve_layout(a: argparse.Namespace, video: Path | None) -> tuple[Layout, list[Box]]:
+    lay = Layout(a.layout, a.crop_x, None, a.split_top)
+    cam_boxes: list[Box] = []
+    if a.layout == "split":
+        if not a.facecam:
+            raise ClipperError("--layout split needs --facecam (x,y,w,h or a saved name).\n"
+                               "  Find the box with: python clipper.py facecam <video_or_url> --at 1:00")
+        cam_boxes = parse_facecam(a.facecam, video)
+        log(f"[layout] split: {len(cam_boxes)} facecam position(s) for '{a.facecam}', facecam panel {lay.top_h}px"
+            + ("" if a.no_facecam_check else "; each clip is checked and falls back to blur if no facecam"))
+    return lay, cam_boxes
+
+
 def cmd_run(a: argparse.Namespace) -> int:
     check_binaries()
     work, out = Path(a.work), Path(a.out)
@@ -776,14 +808,7 @@ def cmd_run(a: argparse.Namespace) -> int:
             raise ClipperError(f"Input file not found: {video}")
         file_sec = sec                   # analyse only this range of the local file
 
-    lay = Layout(a.layout, a.crop_x, None, a.split_top)
-    if a.layout == "split":
-        if not a.facecam:
-            raise ClipperError("--layout split needs --facecam (x,y,w,h or a saved name).\n"
-                               "  Find the box with: python clipper.py facecam <video_or_url> --at 1:00")
-        cam_boxes = parse_facecam(a.facecam, video)
-        log(f"[layout] split: {len(cam_boxes)} facecam position(s) for '{a.facecam}', facecam panel {lay.top_h}px"
-            + ("" if a.no_facecam_check else "; each clip is checked and falls back to blur if no facecam"))
+    lay, cam_boxes = resolve_layout(a, video)
 
     duration = probe_duration(video)
     if a.transcript:
@@ -830,18 +855,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     size = probe_size(video) if a.layout == "split" else (0, 0)
     for i, c in enumerate(clips, 1):
         name = f"clip_{i:02d}_{hms(c.start + offset, '-')}.mp4"
-        clip_lay, used = lay, a.layout
-        if a.layout == "split":
-            if a.no_facecam_check:
-                box, note = cam_boxes[0], "split"
-            else:
-                box, bscore = choose_facecam(video, c, cam_boxes, size)
-                note = f"split (facecam edge {bscore:.1f})" if box else f"blur: no facecam found (edge {bscore:.1f})"
-            if box:
-                clip_lay = Layout("split", a.crop_x, box, a.split_top)
-            else:
-                clip_lay = Layout("blur", a.crop_x, None, a.split_top)
-            used = note
+        clip_lay, used = layout_for_clip(video, c, a, lay, cam_boxes, size)
         log(f"[render] {i}/{len(clips)} {name} ({c.dur:.1f}s, layout={used})")
         render(video, c, out / name, words, clip_lay, not a.no_captions)
         rows.append({"file": name, "start": hms(c.start + offset), "end": hms(c.end + offset),
@@ -862,7 +876,10 @@ def cmd_facecam(a: argparse.Namespace) -> int:
     check_binaries()
     ff = need_bin("ffmpeg")
     at = parse_time(a.at)
-    if is_url(a.source):
+    if is_url(a.source) and a.live:
+        video = grab_live_sample(a.source, Path(a.work))
+        at_in_file = 3.0
+    elif is_url(a.source):
         # only fetch a few seconds around --at
         video = download(a.source, Path(a.work), (at, at + 4))
         at_in_file = 1.0
@@ -924,6 +941,252 @@ def cmd_facecam(a: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Live mode: record a live stream in rolling chunks and clip each chunk as it finishes
+# --------------------------------------------------------------------------- #
+STREAM_QUALITY = "1080p60,1080p,720p60,720p,best"
+
+
+def channel_slug(url: str) -> str:
+    tail = [p for p in re.split(r"[/?#&=]", url.split("://", 1)[-1]) if p][1:] or ["stream"]
+    name = tail[-1] if tail[0] in ("videos", "watch", "live") else tail[0]
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", name.lstrip("@"))[:40] or "stream"
+
+
+def recorder_cmd(url: str, recorder: str) -> list[str]:
+    ff = need_bin("ffmpeg")
+    if recorder == "streamlink":
+        return [sys.executable, "-m", "streamlink", "--stdout", "--loglevel", "warning",
+                "--retry-open", "3", "--hls-live-edge", "3", "--ffmpeg-ffmpeg", ff, url, STREAM_QUALITY]
+    return [sys.executable, "-m", "yt_dlp", "--quiet", "--no-warnings", "--no-part", "-o", "-",
+            "-f", "best[height<=1080]/best", "--ffmpeg-location", str(Path(ff).parent), url]
+
+
+def pick_recorder(choice: str) -> str:
+    if choice != "auto":
+        return choice
+    try:
+        import streamlink  # noqa: F401
+        return "streamlink"
+    except ImportError:
+        log("[live] streamlink not installed (pip install streamlink); using yt-dlp to record. "
+            "Streamlink is recommended: it filters Twitch ads.")
+        return "ytdlp"
+
+
+class Recorder:
+    """streamlink/yt-dlp -> stdout -> ffmpeg segment muxer writing chunk_00000.ts, chunk_00001.ts, ..."""
+
+    def __init__(self, url: str, recorder: str, chunk_dir: Path, chunk_s: int):
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        self.dir = chunk_dir
+        self.log_path = chunk_dir / "recorder.log"
+        self._log = self.log_path.open("w", encoding="utf-8", errors="replace")
+        self.src = subprocess.Popen(recorder_cmd(url, recorder), stdout=subprocess.PIPE, stderr=self._log)
+        seg = [need_bin("ffmpeg"), "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+               "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
+               "-f", "segment", "-segment_time", str(chunk_s), "-segment_format", "mpegts",
+               "-reset_timestamps", "1", str(chunk_dir / "chunk_%05d.ts")]
+        self.seg = subprocess.Popen(seg, stdin=self.src.stdout, stderr=self._log)
+        assert self.src.stdout is not None
+        self.src.stdout.close()   # ffmpeg owns the pipe now
+
+    def running(self) -> bool:
+        return self.seg.poll() is None
+
+    def stop(self) -> None:
+        if self.src.poll() is None:
+            self.src.terminate()          # ffmpeg sees EOF and finalises the last chunk
+        try:
+            self.seg.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.seg.kill()
+        self._log.close()
+
+    def chunks(self) -> list[Path]:
+        """Paths by index (chunk_00000 ... newest), including ones already deleted after processing,
+        so list positions stay equal to chunk numbers."""
+        nums = [int(p.stem.split("_")[1]) for p in self.dir.glob("chunk_*.ts")]
+        return [self.dir / f"chunk_{i:05d}.ts" for i in range(max(nums) + 1)] if nums else []
+
+    def error_tail(self) -> str:
+        try:
+            return "\n".join(self.log_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-6:])
+        except OSError:
+            return ""
+
+
+def grab_live_sample(url: str, work: Path, seconds: int = 8) -> Path:
+    """Record a few seconds of a live stream (for the facecam command)."""
+    work.mkdir(parents=True, exist_ok=True)
+    out_path = work / f"live_sample_{channel_slug(url)}.ts"
+    log(f"[facecam] grabbing {seconds}s from the live stream...")
+    src = subprocess.Popen(recorder_cmd(url, pick_recorder("auto")), stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+    ff = subprocess.run([need_bin("ffmpeg"), "-v", "error", "-y", "-i", "pipe:0", "-t", str(seconds),
+                         "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", str(out_path)],
+                        stdin=src.stdout, capture_output=True)
+    src.kill()
+    err = (src.stderr.read() if src.stderr else b"").decode(errors="replace").strip()
+    if ff.returncode != 0 or not out_path.exists() or out_path.stat().st_size < 10000:
+        raise ClipperError("Couldn't record from the live stream. Is the channel live right now?"
+                           + (f"\n  {err.splitlines()[-1]}" if err else ""))
+    return out_path
+
+
+def concat_ts(parts: list[Path], out_path: Path) -> None:
+    """Join chunks into one file with continuous timestamps (stream copy, takes ~1 s)."""
+    lst = out_path.with_suffix(".txt")
+    lst.write_text("".join(f"file '{p.resolve().as_posix()}'\n" for p in parts), encoding="utf-8")
+    run_cmd([need_bin("ffmpeg"), "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+             "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", str(out_path)])
+    lst.unlink(missing_ok=True)
+
+
+def cmd_live(a: argparse.Namespace) -> int:
+    import time
+    from datetime import datetime, timedelta
+
+    check_binaries()
+    need_bin("ffmpeg")
+    if not is_url(a.source):
+        raise ClipperError("live needs a channel URL, e.g. https://www.twitch.tv/NAME, "
+                           "https://www.youtube.com/@NAME/live or https://kick.com/NAME")
+    chunk_s = int(a.chunk * 60)
+    if chunk_s < max(60, a.max * 2):
+        raise ClipperError(f"--chunk must be at least {max(1.0, a.max * 2 / 60):.1f} minutes for --max {a.max:g}")
+    recorder = pick_recorder(a.recorder)
+    lay, cam_boxes = resolve_layout(a, None)
+    keywords = KEYWORDS + [k.strip().lower() for k in (a.keywords or "").split(",") if k.strip()]
+    slug = channel_slug(a.source)
+    out = Path(a.out) if a.out else Path("live_clips") / slug
+    out.mkdir(parents=True, exist_ok=True)
+    csv_path = out / "clips.csv"
+    fields = ["file", "moment_time", "stream_offset", "duration", "score", "layout", "snippet"]
+    deadline = time.monotonic() + a.max_minutes * 60 if a.max_minutes else None
+    total = 0
+
+    log(f"[live] {a.source} -> {out.resolve()}")
+    log(f"[live] recorder={recorder}, {a.chunk:g}-min chunks, {a.overlap}s overlap, "
+        f"up to {a.top_per_chunk} clip(s) per chunk, model={a.model}. Ctrl+C to stop.")
+
+    while True:   # one iteration per recording session (stream start -> stream end)
+        started = datetime.now()
+        chunk_dir = Path(a.work) / "live" / slug / started.strftime("%Y%m%d-%H%M%S")
+        rec = Recorder(a.source, recorder, chunk_dir, chunk_s)
+        log(f"[live] recording started {started:%Y-%m-%d %H:%M:%S}")
+        chunk_starts: list[float] = []      # chunk index -> seconds since recording start
+        picked: list[tuple[float, float]] = []
+        done, stopping = 0, False
+        try:
+            while True:
+                if deadline and not stopping and time.monotonic() > deadline:
+                    log(f"[live] --max-minutes {a.max_minutes:g} reached, stopping the recording")
+                    rec.stop()
+                    stopping = True
+                alive = rec.running()
+                chunks = rec.chunks()
+                ready = chunks if not alive else chunks[:-1]   # the newest chunk is still being written
+                while done < len(ready):
+                    total += _process_live_chunk(a, ready, done, chunk_starts, picked, started, lay, cam_boxes,
+                                                 keywords, out, csv_path, fields)
+                    done += 1
+                if not alive:
+                    break
+                time.sleep(5)
+        except KeyboardInterrupt:
+            log("\n[live] stopping: finishing the chunks already recorded (Ctrl+C again to quit now)")
+            rec.stop()
+            chunks = rec.chunks()
+            while done < len(chunks):
+                total += _process_live_chunk(a, chunks, done, chunk_starts, picked, started, lay, cam_boxes,
+                                             keywords, out, csv_path, fields)
+                done += 1
+            log(f"[live] done: {total} clip(s) in {out.resolve()}")
+            return 0
+        rec.stop()
+        if done == 0:
+            tail = rec.error_tail()
+            log("[live] the stream isn't live (or couldn't be opened)." + (f"\n        {tail}" if tail else ""))
+        else:
+            log(f"[live] recording ended after {done} chunk(s), "
+                f"{timedelta(seconds=int((datetime.now() - started).total_seconds()))}; {total} clip(s) so far")
+        if not a.keep_chunks:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+        if stopping or not a.wait:
+            break
+        log(f"[live] --wait: checking again in {a.wait_interval}s")
+        time.sleep(a.wait_interval)
+    log(f"[live] done: {total} clip(s) in {out.resolve()}")
+    log("Review every clip by hand before posting, and only clip footage the campaign allows.")
+    return 0
+
+
+def _process_live_chunk(a, chunks, k, chunk_starts, picked, started, lay, cam_boxes, keywords, out,
+                        csv_path, fields) -> int:
+    """Clip chunk k, analysed together with the last `--overlap` seconds of chunk k-1."""
+    import time
+    from datetime import timedelta
+    cur = chunks[k]
+    if not cur.exists():
+        chunk_starts.append(chunk_starts[-1] if chunk_starts else 0.0)
+        return 0
+    dur = probe_duration(cur) or 0.0
+    chunk_starts.append(chunk_starts[-1] + (probe_duration(chunks[k - 1]) or 0.0) if k else 0.0)
+    if dur < a.min:
+        log(f"[live] chunk {k + 1}: only {dur:.0f}s, skipping")
+        return 0
+    if k and chunks[k - 1].exists():
+        prev_dur = chunk_starts[k] - chunk_starts[k - 1]
+        window = cur.with_name(f"window_{k:05d}.ts")
+        concat_ts([chunks[k - 1], cur], window)
+        lo = max(0.0, prev_dur - a.overlap)
+        base = chunk_starts[k - 1]                     # window time 0 = start of chunk k-1
+    else:
+        window, lo, base = cur, 0.0, chunk_starts[k]
+    hi = (probe_duration(window) or (lo + dur))
+    t0 = time.monotonic()
+    tr = transcribe(window, a.model, window.with_suffix(".transcript.json"), (lo, hi))
+    clips = pick_moments(window, tr, lo, hi, a.top_per_chunk * 4, a.min, a.max, keywords)
+    fresh = []
+    for c in clips:
+        s, e = base + c.start, base + c.end
+        if any(s < pe + GAP_BUFFER and e > ps - GAP_BUFFER for ps, pe in picked):
+            continue                                   # already clipped from the previous window
+        fresh.append(c)
+        picked.append((s, e))
+        if len(fresh) >= a.top_per_chunk:
+            break
+    size = probe_size(window) if a.layout == "split" else (0, 0)
+    rows = []
+    for c in fresh:
+        moment = started + timedelta(seconds=base + c.start)
+        name = f"{channel_slug(a.source)}_{moment:%Y%m%d_%H-%M-%S}.mp4"
+        clip_lay, used = layout_for_clip(window, c, a, lay, cam_boxes, size)
+        render(window, c, out / name, all_words(tr), clip_lay, not a.no_captions)
+        rows.append({"file": name, "moment_time": f"{moment:%Y-%m-%d %H:%M:%S}",
+                     "stream_offset": hms(base + c.start), "duration": round(c.dur, 1), "score": c.score,
+                     "layout": used, "snippet": c.snippet})
+        log(f"[live]   + {name} ({c.dur:.0f}s, {used}): {c.snippet[:60]}")
+    if rows:
+        new = not csv_path.exists()
+        with csv_path.open("a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
+            wr = csv.DictWriter(f, fieldnames=fields)
+            if new:
+                wr.writeheader()
+            wr.writerows(rows)
+    log(f"[live] chunk {k + 1} ({hms(chunk_starts[k])}-{hms(chunk_starts[k] + dur)} into the recording): "
+        f"{len(rows)} clip(s), processed in {time.monotonic() - t0:.0f}s")
+    # free disk: the previous chunk is no longer needed, nor are this window's temp files
+    if not a.keep_chunks:
+        if k:
+            chunks[k - 1].unlink(missing_ok=True)
+        if window != cur:
+            window.unlink(missing_ok=True)
+        window.with_suffix(".transcript.json").unlink(missing_ok=True)
+    return len(rows)
+
+
 def _video_id(url: str) -> str | None:
     """Best-effort video id for download caching (YouTube ids, Twitch VOD numbers)."""
     m = re.search(r"(?:v=|youtu\.be/|shorts/|/live/)([A-Za-z0-9_-]{11})", url) \
@@ -941,32 +1204,56 @@ def main(argv: list[str] | None = None) -> int:
             "(yt-dlp is dropping older versions). See README.")
     p = argparse.ArgumentParser(prog="clipper.py", description="Long video -> vertical shorts, fully local.")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    def clip_options(sp, default_model: str) -> None:
+        sp.add_argument("--min", type=float, default=20, help="min clip length s (default 20)")
+        sp.add_argument("--max", type=float, default=45, help="max clip length s (default 45)")
+        sp.add_argument("--model", default=default_model,
+                        help=f"faster-whisper model: tiny/base/small/medium/large-v3 (default {default_model})")
+        sp.add_argument("--layout", choices=["blur", "crop", "split"], default="blur",
+                        help="blur: full frame on blurred bg; crop: 9:16 slice; split: facecam on top, gameplay below")
+        sp.add_argument("--crop-x", type=float, default=0.5,
+                        help="crop/split: gameplay crop position, 0=left, 0.5=centre, 1=right")
+        sp.add_argument("--facecam", help='split: facecam box "x,y,w,h" (0-1 fractions or pixels) or a saved name')
+        sp.add_argument("--split-top", type=float, default=SPLIT_TOP,
+                        help=f"split: share of the height for the facecam panel (default {SPLIT_TOP})")
+        sp.add_argument("--no-facecam-check", action="store_true",
+                        help="split: always use the first facecam box (skip per-clip detection/blur fallback)")
+        sp.add_argument("--no-captions", action="store_true")
+        sp.add_argument("--keywords", default="", help='extra keywords, comma-separated: "chat,clip it"')
+        sp.add_argument("--work", default="work", help="download/cache dir (default work)")
+
     r = sub.add_parser("run", help="download/transcribe/pick/render")
     r.add_argument("source", help="URL (yt-dlp) or local video file")
     r.add_argument("--top", type=int, default=8, help="number of clips (default 8)")
-    r.add_argument("--min", type=float, default=20, help="min clip length s (default 20)")
-    r.add_argument("--max", type=float, default=45, help="max clip length s (default 45)")
-    r.add_argument("--model", default="small", help="faster-whisper model: tiny/base/small/medium/large-v3")
-    r.add_argument("--layout", choices=["blur", "crop", "split"], default="blur",
-                   help="blur: full frame on blurred bg; crop: 9:16 slice; split: facecam on top, gameplay below")
-    r.add_argument("--crop-x", type=float, default=0.5,
-                   help="crop/split: gameplay crop position, 0=left, 0.5=centre, 1=right")
-    r.add_argument("--facecam", help='split: facecam box "x,y,w,h" (0-1 fractions or pixels) or a saved name')
-    r.add_argument("--split-top", type=float, default=SPLIT_TOP,
-                   help=f"split: share of the height for the facecam panel (default {SPLIT_TOP})")
-    r.add_argument("--no-facecam-check", action="store_true",
-                   help="split: always use the first facecam box (skip per-clip detection/blur fallback)")
-    r.add_argument("--no-captions", action="store_true")
-    r.add_argument("--keywords", default="", help='extra keywords, comma-separated: "chat,clip it"')
+    clip_options(r, "small")
     r.add_argument("--section", metavar="START-END",
                    help='only process part of the video, e.g. "1:00:00-1:40:00" or "2:15:00-" (to the end). '
                         "URLs download just that part; clip names/CSV keep the full VOD's timestamps")
     r.add_argument("--transcript", help="use this transcript JSON instead of running Whisper")
-    r.add_argument("--work", default="work", help="download/cache dir (default work)")
     r.add_argument("--out", default="clips", help="output dir (default clips)")
     r.add_argument("--dry-run", action="store_true", help="only print the picks")
+
+    lv = sub.add_parser("live", help="record a live stream and clip it in rolling chunks while it's live")
+    lv.add_argument("source", help="channel URL: https://www.twitch.tv/NAME, https://www.youtube.com/@NAME/live, "
+                                   "https://kick.com/NAME")
+    clip_options(lv, "base")
+    lv.add_argument("--chunk", type=float, default=10, help="minutes per chunk (default 10): lower = faster clips")
+    lv.add_argument("--overlap", type=int, default=60,
+                    help="seconds of the previous chunk re-checked so boundary moments aren't lost (default 60)")
+    lv.add_argument("--top-per-chunk", type=int, default=2, help="max clips per chunk (default 2)")
+    lv.add_argument("--max-minutes", type=float, default=0, help="stop recording after this many minutes")
+    lv.add_argument("--wait", action="store_true",
+                    help="if the channel is offline (or the stream ends), keep checking until it goes live")
+    lv.add_argument("--wait-interval", type=int, default=120, help="seconds between --wait checks (default 120)")
+    lv.add_argument("--recorder", choices=["auto", "streamlink", "ytdlp"], default="auto",
+                    help="auto = streamlink if installed (filters Twitch ads), else yt-dlp")
+    lv.add_argument("--keep-chunks", action="store_true", help="keep the recorded chunks (uses ~2 GB/hour)")
+    lv.add_argument("--out", help="output dir (default live_clips/<channel>)")
+
     f = sub.add_parser("facecam", help="preview/find the facecam box for --layout split and save it per streamer")
     f.add_argument("source", help="local video or URL (a URL downloads only ~4 s around --at)")
+    f.add_argument("--live", action="store_true", help="source is a live channel: grab a frame from the stream now")
     f.add_argument("--at", default="60", help="timestamp to grab the frame from (default 60 = 1:00)")
     f.add_argument("--box", help='facecam box to check, "x,y,w,h" (fractions or pixels)')
     f.add_argument("--save", metavar="NAME",
@@ -986,7 +1273,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_facecam(a)
         if not 0.15 <= a.split_top <= 0.7:
             raise ClipperError("--split-top should be between 0.15 and 0.7")
-        return cmd_run(a)
+        if a.min <= 0 or a.max < a.min:
+            raise ClipperError("--min must be > 0 and --max must be >= --min")
+        return cmd_live(a) if a.cmd == "live" else cmd_run(a)
     except ClipperError as e:
         print(f"\n[error] {e}", file=sys.stderr)
         return 2

@@ -43,6 +43,10 @@ Running `--model base` on 40 minutes of stream took about 7 minutes on a laptop 
 
 Output goes to `clips/clip_01_0-12-34.mp4` and so on, plus `clips/clips.csv` (file, start, end, score, transcript snippet for your post caption). Downloads and transcripts are cached in `work/`, so reruns with different settings skip both steps.
 
+## Live clipping
+
+`python clipper.py live <channel_url> --layout split --facecam NAME` records a live Twitch, YouTube or Kick stream in rolling chunks and outputs clips 10–15 minutes after each moment. To set up a new streamer's cam from their live stream, use `python clipper.py facecam <channel_url> --live`. Details are in [HOW_TO_USE.md](HOW_TO_USE.md#5-live-clipping-while-the-streamer-is-live).
+
 ## Tuning tips
 
 - **`--min` / `--max`**: the scoring window is about (min+max)/2 seconds. Use 15–30 for punchy TikTok/Shorts clips, and 30–60 when you need context, such as a full chase.
